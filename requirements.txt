@@ -1,9 +1,9 @@
 streamlit
-openai
+google-generativeai
 faiss-cpu
 sentence-transformers
 PyPDF2
 python-pptx
-requests
 beautifulsoup4
 duckduckgo-search
+requests
