@@ -22,11 +22,25 @@ st.set_page_config(
 # ---------------- GEMINI INITIALIZATION ----------------
 try:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-    # Primary model (latest & fastest)
-    model = genai.GenerativeModel("gemini-1.5-flash")
-except Exception:
-    # Safe fallback if not available
-    model = genai.GenerativeModel("gemini-1.0-pro")
+
+    # Detect installed SDK version and available models
+    sdk_version = genai.__version__
+    available_models = [m.name for m in genai.list_models()]
+
+    st.sidebar.write("📦 Gemini SDK Version:", sdk_version)
+    st.sidebar.write("✅ Available Models:", available_models)
+
+    # Intelligent model selection
+    if "models/gemini-1.5-flash" in available_models:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+    elif "models/gemini-1.5-pro" in available_models:
+        model = genai.GenerativeModel("gemini-1.5-pro")
+    else:
+        model = genai.GenerativeModel("gemini-1.0-pro")
+
+except Exception as e:
+    st.error(f"⚠️ Gemini initialization failed: {e}")
+    model = None
 
 # ---------------- EMBEDDING MODEL ----------------
 @st.cache_resource
@@ -121,6 +135,9 @@ def web_search(query, num_results=3):
 
 # ---------------- GEMINI RESPONSE ----------------
 def generate_response(query, context_chunks=None, use_web_search=False, web_results=None):
+    if not model:
+        return "⚠️ Gemini model not initialized properly. Please check your API key or SDK version."
+
     if context_chunks:
         context = "\n\n".join(
             f"[Chunk {i+1}] {chunk['text'][:500]}" for i, chunk in enumerate(context_chunks)
@@ -138,7 +155,7 @@ Guidelines:
 - Use simple language (student-friendly)
 - Cite chunks like [Chunk X]
 - If context insufficient, say so politely
-- Keep response within 400 tokens
+- Keep response under 400 tokens
 """
     elif use_web_search and web_results:
         web_context = "\n\n".join(
@@ -154,16 +171,14 @@ Web Results:
 Question: {query}
 
 Guidelines:
-- Summarize answers clearly and accurately
-- Cite sources like [Source X]
-- Use simple, educational tone
+- Summarize clearly
+- Cite sources using [Source X]
+- Use simple educational tone
 """
     else:
         prompt = f"""
-You are Vidya, an AI educational assistant.
-
+You are Vidya, an educational assistant.
 Question: {query}
-
 No materials are uploaded yet. Ask if the user wants to upload study materials or search online.
 """
 
@@ -190,7 +205,6 @@ with st.sidebar:
 
     if st.button("Process Materials", type="primary"):
         all_text = []
-        # Process files
         for file in uploaded_files or []:
             if file.size > MAX_FILE_SIZE:
                 st.error(f"❌ {file.name} exceeds 500 MB limit")
@@ -204,7 +218,6 @@ with st.sidebar:
                     all_text.append(text)
                     st.success(f"✅ {file.name} processed")
 
-        # Process URL
         if url_input:
             with st.spinner(f"Fetching {url_input}..."):
                 text = extract_text_from_url(url_input)
@@ -251,12 +264,12 @@ with st.sidebar:
 # ---------------- CHAT INTERFACE ----------------
 st.markdown("---")
 
-# Display previous messages
+# Display chat history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Input
+# Chat input
 if prompt := st.chat_input("Ask me anything about your materials..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -275,4 +288,12 @@ if prompt := st.chat_input("Ask me anything about your materials..."):
 
     st.session_state.messages.append({"role": "assistant", "content": response})
 
-# ----------------
+# ---------------- FOOTER ----------------
+st.markdown("---")
+st.markdown(
+    "<div style='text-align: center; color: #666;'>"
+    "Developed by <strong>Akash Bauri</strong> | "
+    "Powered by <strong>Gemini (Auto-Detected)</strong> & RAG Architecture"
+    "</div>",
+    unsafe_allow_html=True
+)
