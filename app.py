@@ -30,17 +30,40 @@ try:
     st.sidebar.write("📦 Gemini SDK Version:", sdk_version)
     st.sidebar.write("✅ Available Models:", available_models)
 
-    # Intelligent model selection
-    if "models/gemini-1.5-flash" in available_models:
-        model = genai.GenerativeModel("gemini-1.5-flash")
-    elif "models/gemini-1.5-pro" in available_models:
-        model = genai.GenerativeModel("gemini-1.5-pro")
+    # ✅ Auto-detect and choose the best available Gemini model dynamically
+    model_name = None
+    preferred_order = [
+        "models/gemini-2.5-flash",                      # latest stable flash
+        "models/gemini-2.5-flash-preview-05-20",        # preview variant
+        "models/gemini-2.5-flash-lite-preview-06-17",   # lightweight version
+        "models/gemini-2.5-pro-preview-05-06",          # pro preview
+        "models/gemini-2.5-pro-preview-03-25",          # older pro preview
+    ]
+
+    for name in preferred_order:
+        if name in available_models:
+            model_name = name
+            break
+
+    if model_name:
+        model = genai.GenerativeModel(model_name)
+        st.sidebar.success(f"✅ Using Model: {model_name}")
     else:
-        model = genai.GenerativeModel("gemini-1.0-pro")
+        # As a last fallback, try the latest detected model automatically
+        for m in available_models:
+            if "gemini" in m:
+                model_name = m
+                model = genai.GenerativeModel(model_name)
+                st.sidebar.warning(f"⚙️ Using fallback model: {model_name}")
+                break
+        if not model_name:
+            st.error("⚠️ No supported Gemini model found. Please check your API key.")
+            model = None
 
 except Exception as e:
     st.error(f"⚠️ Gemini initialization failed: {e}")
     model = None
+
 
 # ---------------- EMBEDDING MODEL ----------------
 @st.cache_resource
