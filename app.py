@@ -11,65 +11,59 @@ from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
 import json
 from datetime import datetime
-import io
 
-# Page configuration
+# ---------------- PAGE CONFIG ----------------
 st.set_page_config(
     page_title="Vidya Chatbot - AI Study Assistant",
     page_icon="🧩",
     layout="wide"
 )
 
-# Initialize Gemini client
-genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-model = genai.GenerativeModel("gemini-1.5-flash")
+# ---------------- GEMINI INITIALIZATION ----------------
+try:
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+    # Primary model (latest & fastest)
+    model = genai.GenerativeModel("gemini-1.5-flash")
+except Exception:
+    # Safe fallback if not available
+    model = genai.GenerativeModel("gemini-1.0-pro")
 
-# Initialize embedding model
+# ---------------- EMBEDDING MODEL ----------------
 @st.cache_resource
 def load_embedding_model():
     return SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
 
 embedding_model = load_embedding_model()
 
-# Initialize session state
-if 'messages' not in st.session_state:
-    st.session_state.messages = []
-if 'vector_store' not in st.session_state:
-    st.session_state.vector_store = None
-if 'documents' not in st.session_state:
-    st.session_state.documents = []
-if 'embeddings' not in st.session_state:
-    st.session_state.embeddings = None
+# ---------------- SESSION STATE ----------------
+for key in ['messages', 'vector_store', 'documents', 'embeddings']:
+    if key not in st.session_state:
+        st.session_state[key] = [] if key == 'messages' else None
 
-# Configuration
+# ---------------- CONFIG CONSTANTS ----------------
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
 SIMILARITY_THRESHOLD = 0.40
 TOP_K = 6
 
+# ---------------- TEXT EXTRACTION ----------------
 def extract_text_from_pdf(file):
     try:
         pdf_reader = PyPDF2.PdfReader(file)
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text() + "\n"
-        return text
+        return "\n".join(page.extract_text() or "" for page in pdf_reader.pages)
     except Exception as e:
-        st.error(f"Error reading PDF: {str(e)}")
+        st.error(f"Error reading PDF: {e}")
         return None
 
 def extract_text_from_pptx(file):
     try:
         prs = Presentation(file)
-        text = ""
-        for slide in prs.slides:
-            for shape in slide.shapes:
-                if hasattr(shape, "text"):
-                    text += shape.text + "\n"
-        return text
+        return "\n".join(
+            shape.text for slide in prs.slides for shape in slide.shapes if hasattr(shape, "text")
+        )
     except Exception as e:
-        st.error(f"Error reading PPTX: {str(e)}")
+        st.error(f"Error reading PPTX: {e}")
         return None
 
 def extract_text_from_url(url):
@@ -78,155 +72,145 @@ def extract_text_from_url(url):
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
-        for script in soup(["script", "style"]):
-            script.decompose()
-        text = soup.get_text()
-        lines = (line.strip() for line in text.splitlines())
-        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-        text = '\n'.join(chunk for chunk in chunks if chunk)
+        for s in soup(["script", "style"]): s.decompose()
+        text = " ".join(t.strip() for t in soup.get_text().splitlines() if t.strip())
         return text
     except Exception as e:
-        st.error(f"Error fetching URL: {str(e)}")
+        st.error(f"Error fetching URL: {e}")
         return None
 
+# ---------------- CHUNKING ----------------
 def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    chunks = []
-    start = 0
-    text_length = len(text)
+    chunks, start, text_length = [], 0, len(text)
     while start < text_length:
         end = start + chunk_size
-        chunk = text[start:end]
-        chunks.append(chunk)
+        chunks.append(text[start:end])
         start += chunk_size - overlap
     return chunks
 
+# ---------------- VECTOR STORE ----------------
 def create_vector_store(documents):
     if not documents:
         return None, None
     with st.spinner("Creating embeddings..."):
-        embeddings = embedding_model.encode(documents, show_progress_bar=True)
-        embeddings = np.array(embeddings).astype('float32')
+        embeddings = np.array(embedding_model.encode(documents, show_progress_bar=True)).astype('float32')
         faiss.normalize_L2(embeddings)
-        dimension = embeddings.shape[1]
-        index = faiss.IndexFlatIP(dimension)
+        index = faiss.IndexFlatIP(embeddings.shape[1])
         index.add(embeddings)
     return index, embeddings
 
 def retrieve_relevant_chunks(query, top_k=TOP_K):
     if st.session_state.vector_store is None:
         return []
-    query_embedding = embedding_model.encode([query])
-    query_embedding = np.array(query_embedding).astype('float32')
+    query_embedding = np.array(embedding_model.encode([query])).astype('float32')
     faiss.normalize_L2(query_embedding)
     distances, indices = st.session_state.vector_store.search(query_embedding, top_k)
-    results = []
-    for dist, idx in zip(distances[0], indices[0]):
-        if dist >= SIMILARITY_THRESHOLD:
-            results.append({
-                'text': st.session_state.documents[idx],
-                'similarity': float(dist)
-            })
-    return results
+    return [
+        {'text': st.session_state.documents[i], 'similarity': float(d)}
+        for d, i in zip(distances[0], indices[0]) if d >= SIMILARITY_THRESHOLD
+    ]
 
+# ---------------- WEB SEARCH ----------------
 def web_search(query, num_results=3):
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=num_results))
-            return results
+            return list(ddgs.text(query, max_results=num_results))
     except Exception as e:
-        st.error(f"Web search error: {str(e)}")
+        st.error(f"Web search error: {e}")
         return []
 
+# ---------------- GEMINI RESPONSE ----------------
 def generate_response(query, context_chunks=None, use_web_search=False, web_results=None):
-    """Generate response using Gemini"""
     if context_chunks:
-        context = "\n\n".join([f"[Chunk {i+1}] {chunk['text'][:500]}" 
-                               for i, chunk in enumerate(context_chunks)])
+        context = "\n\n".join(
+            f"[Chunk {i+1}] {chunk['text'][:500]}" for i, chunk in enumerate(context_chunks)
+        )
         prompt = f"""
-You are Vidya, an intelligent educational assistant. Answer based on the provided context.
+You are Vidya, an intelligent educational assistant.
+Use the following context to answer the question clearly and accurately.
 
 Context from uploaded materials:
 {context}
 
 Question: {query}
 
-Instructions:
-- Give clear, accurate, student-friendly answers
-- Cite chunks using [Chunk X]
-- If not in context, state that politely
-- Limit to 400 tokens
+Guidelines:
+- Use simple language (student-friendly)
+- Cite chunks like [Chunk X]
+- If context insufficient, say so politely
+- Keep response within 400 tokens
 """
     elif use_web_search and web_results:
-        web_context = "\n\n".join([f"[Source {i+1}] {r['title']}: {r['body'][:300]}"
-                                   for i, r in enumerate(web_results)])
+        web_context = "\n\n".join(
+            f"[Source {i+1}] {r['title']}: {r['body'][:300]}" for i, r in enumerate(web_results)
+        )
         prompt = f"""
-You are Vidya, an intelligent educational assistant. Uploaded materials lack details, so these are web search results.
+You are Vidya, a helpful educational assistant.
+These are search results from the web.
 
 Web Results:
 {web_context}
 
 Question: {query}
 
-Instructions:
-- Give accurate, clear answers
-- Cite sources using [Source X]
-- Keep response under 400 tokens
+Guidelines:
+- Summarize answers clearly and accurately
+- Cite sources like [Source X]
+- Use simple, educational tone
 """
     else:
         prompt = f"""
-You are Vidya, an educational assistant.
+You are Vidya, an AI educational assistant.
 
 Question: {query}
 
-No study materials found for this topic. Ask if the user wants to upload materials or search online.
+No materials are uploaded yet. Ask if the user wants to upload study materials or search online.
 """
 
     try:
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        st.error(f"Error generating response: {str(e)}")
-        return "⚠️ I encountered an error generating the response. Please try again."
+        st.error(f"⚠️ Error generating response: {e}")
+        return "I encountered an issue generating a response. Please try again."
 
-# UI Components
+# ---------------- UI SECTION ----------------
 st.title("🧩 Vidya Chatbot")
 st.markdown("### AI-Powered Educational Assistant")
 st.markdown("*Ask questions about your study materials or any topic!*")
 
-# Sidebar for file upload
+# Sidebar for Uploads
 with st.sidebar:
     st.header("📚 Upload Study Materials")
 
     uploaded_files = st.file_uploader(
-        "Upload PDF or PPTX files",
-        type=['pdf', 'pptx'],
-        accept_multiple_files=True
+        "Upload PDF or PPTX files", type=['pdf', 'pptx'], accept_multiple_files=True
     )
     url_input = st.text_input("Or enter a URL:")
 
     if st.button("Process Materials", type="primary"):
         all_text = []
+        # Process files
+        for file in uploaded_files or []:
+            if file.size > MAX_FILE_SIZE:
+                st.error(f"❌ {file.name} exceeds 500 MB limit")
+                continue
+            with st.spinner(f"Processing {file.name}..."):
+                text = (
+                    extract_text_from_pdf(file) if file.name.endswith(".pdf")
+                    else extract_text_from_pptx(file)
+                )
+                if text:
+                    all_text.append(text)
+                    st.success(f"✅ {file.name} processed")
 
-        if uploaded_files:
-            for file in uploaded_files:
-                if file.size > MAX_FILE_SIZE:
-                    st.error(f"❌ {file.name} exceeds 500 MB limit")
-                    continue
-                with st.spinner(f"Processing {file.name}..."):
-                    if file.name.endswith('.pdf'):
-                        text = extract_text_from_pdf(file)
-                    elif file.name.endswith('.pptx'):
-                        text = extract_text_from_pptx(file)
-                    if text:
-                        all_text.append(text)
-                        st.success(f"✅ {file.name} processed")
-
+        # Process URL
         if url_input:
             with st.spinner(f"Fetching {url_input}..."):
                 text = extract_text_from_url(url_input)
                 if text:
                     all_text.append(text)
-                    st.success(f"✅ URL processed")
+                    st.success("✅ URL processed")
 
         if all_text:
             combined_text = "\n\n".join(all_text)
@@ -237,10 +221,9 @@ with st.sidebar:
             st.session_state.embeddings = embeddings
             st.success(f"✨ Created {len(chunks)} searchable chunks!")
         else:
-            st.warning("No materials to process")
+            st.warning("No valid materials found.")
 
     st.markdown("---")
-
     if st.button("🗑️ Clear Chat"):
         st.session_state.messages = []
         st.rerun()
@@ -265,13 +248,15 @@ with st.sidebar:
     else:
         st.warning("⚠️ No materials loaded")
 
-# Chat interface
+# ---------------- CHAT INTERFACE ----------------
 st.markdown("---")
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+# Display previous messages
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
+# Input
 if prompt := st.chat_input("Ask me anything about your materials..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -279,22 +264,15 @@ if prompt := st.chat_input("Ask me anything about your materials..."):
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            relevant_chunks = retrieve_relevant_chunks(prompt)
-            if relevant_chunks:
-                response = generate_response(prompt, relevant_chunks)
+            chunks = retrieve_relevant_chunks(prompt)
+            if chunks:
+                response = generate_response(prompt, chunks)
             else:
                 st.info("🔍 Searching the web for information...")
                 web_results = web_search(prompt)
-                response = generate_response(prompt, None, use_web_search=True, web_results=web_results)
+                response = generate_response(prompt, None, True, web_results)
             st.markdown(response)
 
     st.session_state.messages.append({"role": "assistant", "content": response})
 
-st.markdown("---")
-st.markdown(
-    "<div style='text-align: center; color: #666;'>"
-    "Developed by <strong>Akash Bauri</strong> | "
-    "Powered by Gemini 1.5 Flash & RAG Architecture"
-    "</div>",
-    unsafe_allow_html=True
-)
+# ----------------
