@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
 import json
 from datetime import datetime
+import re
 
 # ---------------- PAGE CONFIG ----------------
 st.set_page_config(
@@ -22,22 +23,19 @@ st.set_page_config(
 # ---------------- GEMINI INITIALIZATION ----------------
 try:
     genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-
-    # Detect installed SDK version and available models
     sdk_version = genai.__version__
     available_models = [m.name for m in genai.list_models()]
 
     st.sidebar.write("📦 Gemini SDK Version:", sdk_version)
     st.sidebar.write("✅ Available Models:", available_models)
 
-    # ✅ Auto-detect and choose the best available Gemini model dynamically
     model_name = None
     preferred_order = [
-        "models/gemini-2.5-flash",                      # latest stable flash
-        "models/gemini-2.5-flash-preview-05-20",        # preview variant
-        "models/gemini-2.5-flash-lite-preview-06-17",   # lightweight version
-        "models/gemini-2.5-pro-preview-05-06",          # pro preview
-        "models/gemini-2.5-pro-preview-03-25",          # older pro preview
+        "models/gemini-2.5-flash",
+        "models/gemini-2.5-flash-preview-05-20",
+        "models/gemini-2.5-flash-lite-preview-06-17",
+        "models/gemini-2.5-pro-preview-05-06",
+        "models/gemini-2.5-pro-preview-03-25",
     ]
 
     for name in preferred_order:
@@ -49,7 +47,6 @@ try:
         model = genai.GenerativeModel(model_name)
         st.sidebar.success(f"✅ Using Model: {model_name}")
     else:
-        # As a last fallback, try the latest detected model automatically
         for m in available_models:
             if "gemini" in m:
                 model_name = m
@@ -64,7 +61,6 @@ except Exception as e:
     st.error(f"⚠️ Gemini initialization failed: {e}")
     model = None
 
-
 # ---------------- EMBEDDING MODEL ----------------
 @st.cache_resource
 def load_embedding_model():
@@ -73,22 +69,27 @@ def load_embedding_model():
 embedding_model = load_embedding_model()
 
 # ---------------- SESSION STATE ----------------
-for key in ['messages', 'vector_store', 'documents', 'embeddings']:
+for key in ['messages', 'vector_store', 'documents', 'embeddings', 'sources']:
     if key not in st.session_state:
         st.session_state[key] = [] if key == 'messages' else None
 
 # ---------------- CONFIG CONSTANTS ----------------
-MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB
+MAX_FILE_SIZE = 500 * 1024 * 1024
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
-SIMILARITY_THRESHOLD = 0.40
+SIMILARITY_THRESHOLD = 0.25
 TOP_K = 6
 
 # ---------------- TEXT EXTRACTION ----------------
 def extract_text_from_pdf(file):
     try:
         pdf_reader = PyPDF2.PdfReader(file)
-        return "\n".join(page.extract_text() or "" for page in pdf_reader.pages)
+        text = ""
+        for i, page in enumerate(pdf_reader.pages):
+            page_text = page.extract_text()
+            if page_text:
+                text += f"\n[Source: {file.name}, Page {i+1}]\n{page_text}"
+        return text
     except Exception as e:
         st.error(f"Error reading PDF: {e}")
         return None
@@ -96,9 +97,15 @@ def extract_text_from_pdf(file):
 def extract_text_from_pptx(file):
     try:
         prs = Presentation(file)
-        return "\n".join(
-            shape.text for slide in prs.slides for shape in slide.shapes if hasattr(shape, "text")
-        )
+        text = ""
+        for i, slide in enumerate(prs.slides):
+            slide_text = ""
+            for shape in slide.shapes:
+                if hasattr(shape, "text"):
+                    slide_text += shape.text + "\n"
+            if slide_text.strip():
+                text += f"\n[Source: {file.name}, Slide {i+1}]\n{slide_text}"
+        return text
     except Exception as e:
         st.error(f"Error reading PPTX: {e}")
         return None
@@ -111,7 +118,7 @@ def extract_text_from_url(url):
         soup = BeautifulSoup(response.content, 'html.parser')
         for s in soup(["script", "style"]): s.decompose()
         text = " ".join(t.strip() for t in soup.get_text().splitlines() if t.strip())
-        return text
+        return f"[Source: {url}]\n{text}"
     except Exception as e:
         st.error(f"Error fetching URL: {e}")
         return None
@@ -136,16 +143,20 @@ def create_vector_store(documents):
         index.add(embeddings)
     return index, embeddings
 
+def clean_text_for_embedding(text):
+    return re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', '', text)).strip()
+
 def retrieve_relevant_chunks(query, top_k=TOP_K):
     if st.session_state.vector_store is None:
         return []
-    query_embedding = np.array(embedding_model.encode([query])).astype('float32')
+    query_embedding = np.array(embedding_model.encode([clean_text_for_embedding(query)])).astype('float32')
     faiss.normalize_L2(query_embedding)
     distances, indices = st.session_state.vector_store.search(query_embedding, top_k)
-    return [
-        {'text': st.session_state.documents[i], 'similarity': float(d)}
-        for d, i in zip(distances[0], indices[0]) if d >= SIMILARITY_THRESHOLD
-    ]
+    results = []
+    for d, i in zip(distances[0], indices[0]):
+        if d >= SIMILARITY_THRESHOLD:
+            results.append({'text': st.session_state.documents[i], 'similarity': float(d)})
+    return results
 
 # ---------------- WEB SEARCH ----------------
 def web_search(query, num_results=3):
@@ -157,73 +168,66 @@ def web_search(query, num_results=3):
         return []
 
 # ---------------- GEMINI RESPONSE ----------------
-def generate_response(query, context_chunks=None, use_web_search=False, web_results=None):
+def generate_response(query, context_chunks=None, web_results=None):
     if not model:
-        return "⚠️ Gemini model not initialized properly. Please check your API key or SDK version."
+        return "⚠️ Gemini model not initialized properly."
 
     if context_chunks:
         context = "\n\n".join(
-            f"[Chunk {i+1}] {chunk['text'][:500]}" for i, chunk in enumerate(context_chunks)
+            f"[Context {i+1}] {chunk['text'][:500]}" for i, chunk in enumerate(context_chunks)
         )
         prompt = f"""
 You are Vidya, an intelligent educational assistant.
-Use the following context to answer the question clearly and accurately.
+Answer the question using the context below and cite the file/slide/page source at the end of each point.
 
-Context from uploaded materials:
+Context from user materials:
 {context}
 
 Question: {query}
 
-Guidelines:
-- Use simple language (student-friendly)
-- Cite chunks like [Chunk X]
-- If context insufficient, say so politely
-- Keep response under 400 tokens
+Instructions:
+- Always include sources in brackets (e.g., [Source: Python_Notes.pdf, Page 4])
+- If information comes from multiple files, summarize them clearly
+- Keep it short and clear for students
 """
-    elif use_web_search and web_results:
+    elif web_results:
         web_context = "\n\n".join(
-            f"[Source {i+1}] {r['title']}: {r['body'][:300]}" for i, r in enumerate(web_results)
+            f"[Web {i+1}] {r['title']} - {r['body'][:300]} (Source: {r['href']})"
+            for i, r in enumerate(web_results)
         )
         prompt = f"""
 You are Vidya, a helpful educational assistant.
-These are search results from the web.
+Use the web search results below to answer the question accurately and include citations.
 
 Web Results:
 {web_context}
 
 Question: {query}
 
-Guidelines:
-- Summarize clearly
-- Cite sources using [Source X]
-- Use simple educational tone
+Instructions:
+- Summarize clearly using the most relevant sources
+- Always include [Source: website.com] citations
+- Keep your tone simple and educational
 """
     else:
-        prompt = f"""
-You are Vidya, an educational assistant.
-Question: {query}
-No materials are uploaded yet. Ask if the user wants to upload study materials or search online.
-"""
+        prompt = f"You are Vidya, an educational AI. Answer this: {query}"
 
     try:
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
         st.error(f"⚠️ Error generating response: {e}")
-        return "I encountered an issue generating a response. Please try again."
+        return "I encountered an issue generating a response."
 
 # ---------------- UI SECTION ----------------
 st.title("🧩 Vidya Chatbot")
 st.markdown("### AI-Powered Educational Assistant")
 st.markdown("*Ask questions about your study materials or any topic!*")
 
-# Sidebar for Uploads
+# Sidebar
 with st.sidebar:
     st.header("📚 Upload Study Materials")
-
-    uploaded_files = st.file_uploader(
-        "Upload PDF or PPTX files", type=['pdf', 'pptx'], accept_multiple_files=True
-    )
+    uploaded_files = st.file_uploader("Upload PDF or PPTX files", type=['pdf', 'pptx'], accept_multiple_files=True)
     url_input = st.text_input("Or enter a URL:")
 
     if st.button("Process Materials", type="primary"):
@@ -233,10 +237,7 @@ with st.sidebar:
                 st.error(f"❌ {file.name} exceeds 500 MB limit")
                 continue
             with st.spinner(f"Processing {file.name}..."):
-                text = (
-                    extract_text_from_pdf(file) if file.name.endswith(".pdf")
-                    else extract_text_from_pptx(file)
-                )
+                text = extract_text_from_pdf(file) if file.name.endswith(".pdf") else extract_text_from_pptx(file)
                 if text:
                     all_text.append(text)
                     st.success(f"✅ {file.name} processed")
@@ -264,35 +265,19 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-    if st.button("📥 Export Chat"):
-        if st.session_state.messages:
-            chat_export = {
-                'timestamp': datetime.now().isoformat(),
-                'messages': st.session_state.messages
-            }
-            st.download_button(
-                label="Download JSON",
-                data=json.dumps(chat_export, indent=2),
-                file_name=f"vidya_chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json"
-            )
-
-    st.markdown("---")
     st.markdown("**📊 Status**")
     if st.session_state.vector_store:
         st.info(f"✅ {len(st.session_state.documents)} chunks loaded")
     else:
         st.warning("⚠️ No materials loaded")
 
-# ---------------- CHAT INTERFACE ----------------
+# ---------------- CHAT SECTION ----------------
 st.markdown("---")
 
-# Display chat history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Chat input
 if prompt := st.chat_input("Ask me anything about your materials..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -301,12 +286,12 @@ if prompt := st.chat_input("Ask me anything about your materials..."):
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             chunks = retrieve_relevant_chunks(prompt)
-            if chunks:
+            if chunks and len(chunks) > 0:
                 response = generate_response(prompt, chunks)
             else:
                 st.info("🔍 Searching the web for information...")
                 web_results = web_search(prompt)
-                response = generate_response(prompt, None, True, web_results)
+                response = generate_response(prompt, None, web_results)
             st.markdown(response)
 
     st.session_state.messages.append({"role": "assistant", "content": response})
@@ -316,7 +301,8 @@ st.markdown("---")
 st.markdown(
     "<div style='text-align: center; color: #666;'>"
     "Developed by <strong>Akash Bauri</strong> | "
-    "Powered by <strong>Gemini (Auto-Detected)</strong> & RAG Architecture"
+    "Powered by <strong>Gemini (Hybrid RAG + Web)</strong>"
     "</div>",
     unsafe_allow_html=True
 )
+
