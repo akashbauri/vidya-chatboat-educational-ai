@@ -261,53 +261,52 @@ def web_search(query, num_results=3):
         return []
 
 # ============================================================
-# GEMINI RESPONSE (IMPROVED PROMPTS)
+# GEMINI RESPONSE (STRICT MATERIAL-FIRST MODE)
 # ============================================================
 def generate_response(query, context_chunks=None, web_results=None):
     if not model:
         return "⚠️ Gemini model not initialized properly."
 
     if context_chunks:
-        # Build context from retrieved chunks
+        # Build context from YOUR uploaded materials
         context = "\n\n".join(
-            f"[Context {i+1}] {chunk['text'][:600]}" for i, chunk in enumerate(context_chunks)
+            f"[Context {i+1}] {chunk['text'][:700]}" for i, chunk in enumerate(context_chunks)
         )
         
-        # IMPROVED PROMPT - More natural, conversational responses
-        prompt = f"""You are Vidya, a friendly and helpful educational AI assistant. A student has asked you a question about their study materials.
+        # STRICT PROMPT - Only answer from uploaded materials
+        prompt = f"""You are Vidya, a helpful educational AI assistant. A student has uploaded study materials and asked a question.
 
-Context from the student's materials:
+**IMPORTANT:** Answer ONLY using the information from the student's uploaded materials shown below. Do not use your general knowledge or external information.
+
+Student's Uploaded Materials:
 {context}
 
 Student's Question: {query}
 
 Instructions:
-- Give a clear, direct, and easy-to-understand answer
-- Write naturally as if explaining to a friend
-- Synthesize information from the context instead of listing it
-- If the question asks for code, provide complete, working code examples
-- Add sources at the END of your answer in a "Sources" section, not inline
-- Be concise but thorough
-- Use bullet points or numbered lists when appropriate
-- If multiple files mention the same concept, combine them smoothly
+- Answer ONLY from the materials above
+- If the question asks for code and code is shown in the materials, provide the exact code
+- If the materials don't contain enough information, say: "I couldn't find complete information about this in your uploaded materials. Would you like me to search the web?"
+- Write naturally and clearly, like explaining to a friend
+- Put sources at the END in a "Sources" section with file names and page/slide numbers
+- Synthesize information smoothly - don't just list fragments
+- Be specific and practical
 
-Format your response like this:
-[Your clear, helpful answer here]
+Format:
+[Your clear answer based ONLY on the uploaded materials]
 
 **Sources:**
-- [File name, Page X]
-- [File name, Page Y]
+- [Exact file name, Page/Slide X]
 """
     
     elif web_results:
-        # Build context from web search
+        # Only used when materials don't have the answer
         web_context = "\n\n".join(
             f"[Result {i+1}] {r['title']}\n{r['body'][:400]}\nURL: {r['href']}"
             for i, r in enumerate(web_results)
         )
         
-        # IMPROVED WEB SEARCH PROMPT
-        prompt = f"""You are Vidya, a friendly educational AI assistant. A student asked a question, and I searched the web for information.
+        prompt = f"""You are Vidya, a helpful educational AI assistant. The student's uploaded materials didn't contain the answer, so I searched the web.
 
 Web Search Results:
 {web_context}
@@ -315,30 +314,28 @@ Web Search Results:
 Student's Question: {query}
 
 Instructions:
-- Give a clear, helpful answer based on the search results
+- Provide a clear, helpful answer based on the web results
+- If the question asks for code, provide complete working examples
 - Write naturally and conversationally
-- If the question asks for code or examples, provide them
-- Cite sources at the END in a "Sources" section
-- Be accurate but easy to understand
-- Don't say "based on the search results" - just answer directly
+- Cite sources at the END
+- Be accurate and educational
 
 Format:
-[Your helpful answer]
+[Your helpful answer from web sources]
 
-**Sources:**
-- [Website name - URL]
+**Web Sources:**
+- [Source name - URL]
 """
     
     else:
-        # No context - use general knowledge
+        # Fallback when no context available
         prompt = f"""You are Vidya, a friendly educational AI assistant.
 
 Student's Question: {query}
 
 Instructions:
-- Answer clearly and helpfully using your knowledge
+- Answer clearly using your knowledge
 - If it's a coding question, provide complete working code
-- Use simple language suitable for students
 - Be concise but thorough
 - Use examples when helpful
 """
@@ -436,12 +433,15 @@ if prompt := st.chat_input("Ask me anything about your materials..."):
 
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
+            # First priority: Search uploaded materials
             chunks = retrieve_relevant_chunks(prompt)
             
             if chunks and len(chunks) > 0:
+                # Answer from uploaded materials
                 response = generate_response(prompt, chunks)
             else:
-                st.info("🔍 Searching the web for information...")
+                # Fallback to web search only if materials don't have answer
+                st.info("🔍 I couldn't find this in your materials. Searching the web...")
                 web_results = web_search(prompt)
                 response = generate_response(prompt, None, web_results)
                 
