@@ -156,63 +156,40 @@ def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     return chunks
 
 # ============================================================
-# VECTOR STORE (SUPER FIXED VERSION)
+# VECTOR STORE
 # ============================================================
 def create_vector_store(documents):
-    """
-    Create FAISS vector index from document chunks.
-    Ultra-strict validation to prevent TextEncodeInput errors.
-    """
     if not documents:
         return None, None
 
-    # AGGRESSIVE CLEANING AND VALIDATION
     cleaned_docs = []
     
     for idx, d in enumerate(documents):
-        # Skip None, empty, or invalid types
         if d is None:
             continue
             
-        # Handle lists/tuples by joining
         if isinstance(d, (list, tuple)):
             try:
                 d = " ".join(str(x) for x in d if x is not None)
             except:
                 continue
         
-        # Convert everything to string
         try:
             d = str(d)
         except:
             continue
         
-        # Strip whitespace
         d = d.strip()
         
-        # Only keep strings with actual content (at least 3 characters)
         if len(d) >= 3:
             cleaned_docs.append(d)
     
-    # Final validation
     if not cleaned_docs:
         st.warning("No valid text chunks found after cleaning.")
         return None, None
     
-    # DEBUG: Show what we're encoding
-    st.write(f"🔍 Debug: Encoding {len(cleaned_docs)} chunks")
-    st.write(f"🔍 First chunk type: {type(cleaned_docs[0])}")
-    st.write(f"🔍 First chunk preview: {cleaned_docs[0][:100]}...")
-    
-    # Validate all items are strings
-    for idx, doc in enumerate(cleaned_docs):
-        if not isinstance(doc, str):
-            st.error(f"❌ Item {idx} is not a string: {type(doc)}")
-            return None, None
-    
     try:
         with st.spinner("Creating embeddings..."):
-            # Encode with explicit parameters
             embeddings = embedding_model.encode(
                 cleaned_docs,
                 batch_size=32,
@@ -221,34 +198,25 @@ def create_vector_store(documents):
                 normalize_embeddings=False
             )
             
-            # Convert to float32 numpy array
             embeddings = np.array(embeddings, dtype='float32')
-            
-            # Normalize for cosine similarity
             faiss.normalize_L2(embeddings)
             
-            # Create FAISS index
             dimension = embeddings.shape[1]
             index = faiss.IndexFlatIP(dimension)
             index.add(embeddings)
-            
-            st.success(f"✅ Successfully created {len(cleaned_docs)} embeddings!")
             
             return index, embeddings
             
     except Exception as e:
         st.error(f"❌ Error creating embeddings: {str(e)}")
-        st.error(f"Error type: {type(e).__name__}")
         return None, None
 
 def clean_text_for_embedding(text):
-    """Remove special characters and normalize whitespace."""
     text = re.sub(r'[^\w\s]', '', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
 def retrieve_relevant_chunks(query, top_k=TOP_K):
-    """Retrieve most similar chunks for a query."""
     if st.session_state.vector_store is None:
         return []
     
@@ -257,7 +225,6 @@ def retrieve_relevant_chunks(query, top_k=TOP_K):
         return []
     
     try:
-        # Encode query
         query_embedding = embedding_model.encode(
             [query_clean],
             convert_to_numpy=True,
@@ -266,10 +233,8 @@ def retrieve_relevant_chunks(query, top_k=TOP_K):
         query_embedding = np.array(query_embedding, dtype='float32')
         faiss.normalize_L2(query_embedding)
         
-        # Search
         distances, indices = st.session_state.vector_store.search(query_embedding, top_k)
         
-        # Filter results
         results = []
         for d, i in zip(distances[0], indices[0]):
             if d >= SIMILARITY_THRESHOLD and 0 <= i < len(st.session_state.documents):
@@ -296,51 +261,87 @@ def web_search(query, num_results=3):
         return []
 
 # ============================================================
-# GEMINI RESPONSE
+# GEMINI RESPONSE (IMPROVED PROMPTS)
 # ============================================================
 def generate_response(query, context_chunks=None, web_results=None):
     if not model:
         return "⚠️ Gemini model not initialized properly."
 
     if context_chunks:
+        # Build context from retrieved chunks
         context = "\n\n".join(
-            f"[Context {i+1}] {chunk['text'][:500]}" for i, chunk in enumerate(context_chunks)
+            f"[Context {i+1}] {chunk['text'][:600]}" for i, chunk in enumerate(context_chunks)
         )
-        prompt = f"""
-You are Vidya, an intelligent educational assistant.
-Answer the question using the context below and cite the file/slide/page source at the end of each point.
+        
+        # IMPROVED PROMPT - More natural, conversational responses
+        prompt = f"""You are Vidya, a friendly and helpful educational AI assistant. A student has asked you a question about their study materials.
 
-Context from user materials:
+Context from the student's materials:
 {context}
 
-Question: {query}
+Student's Question: {query}
 
 Instructions:
-- Always include sources in brackets (e.g., [Source: Python_Notes.pdf, Page 4])
-- If information comes from multiple files, summarize them clearly
-- Keep it short and clear for students
+- Give a clear, direct, and easy-to-understand answer
+- Write naturally as if explaining to a friend
+- Synthesize information from the context instead of listing it
+- If the question asks for code, provide complete, working code examples
+- Add sources at the END of your answer in a "Sources" section, not inline
+- Be concise but thorough
+- Use bullet points or numbered lists when appropriate
+- If multiple files mention the same concept, combine them smoothly
+
+Format your response like this:
+[Your clear, helpful answer here]
+
+**Sources:**
+- [File name, Page X]
+- [File name, Page Y]
 """
+    
     elif web_results:
+        # Build context from web search
         web_context = "\n\n".join(
-            f"[Web {i+1}] {r['title']} - {r['body'][:300]} (Source: {r['href']})"
+            f"[Result {i+1}] {r['title']}\n{r['body'][:400]}\nURL: {r['href']}"
             for i, r in enumerate(web_results)
         )
-        prompt = f"""
-You are Vidya, a helpful educational assistant.
-Use the web search results below to answer the question accurately and include citations.
+        
+        # IMPROVED WEB SEARCH PROMPT
+        prompt = f"""You are Vidya, a friendly educational AI assistant. A student asked a question, and I searched the web for information.
 
-Web Results:
+Web Search Results:
 {web_context}
 
-Question: {query}
+Student's Question: {query}
 
 Instructions:
-- Summarize clearly using the most relevant sources
-- Always include [Source: website.com] citations
-- Keep your tone simple and educational
+- Give a clear, helpful answer based on the search results
+- Write naturally and conversationally
+- If the question asks for code or examples, provide them
+- Cite sources at the END in a "Sources" section
+- Be accurate but easy to understand
+- Don't say "based on the search results" - just answer directly
+
+Format:
+[Your helpful answer]
+
+**Sources:**
+- [Website name - URL]
 """
+    
     else:
-        prompt = f"You are Vidya, an educational AI. Answer this: {query}"
+        # No context - use general knowledge
+        prompt = f"""You are Vidya, a friendly educational AI assistant.
+
+Student's Question: {query}
+
+Instructions:
+- Answer clearly and helpfully using your knowledge
+- If it's a coding question, provide complete working code
+- Use simple language suitable for students
+- Be concise but thorough
+- Use examples when helpful
+"""
 
     try:
         response = model.generate_content(prompt)
@@ -398,6 +399,9 @@ with st.sidebar:
                 index, embeddings = create_vector_store(chunks)
                 st.session_state.vector_store = index
                 st.session_state.embeddings = embeddings
+                
+                if index is not None:
+                    st.success(f"✨ Created {len(chunks)} searchable chunks!")
             else:
                 st.warning("No chunks created from materials.")
         else:
